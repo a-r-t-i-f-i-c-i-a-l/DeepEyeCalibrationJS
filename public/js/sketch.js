@@ -6,6 +6,20 @@ const DEFAULTSTYLE = {
     
 }
 
+const BLACK_ON_GREY = {
+    fill: 0,
+    background: 160,
+    textStrokeWeight: 3,
+    textStrokeColor: [255, 255, 255]
+}
+
+const GREY_ON_BLACK = {
+    fill: 208,
+    background: 0,
+    textStrokeWeight: 3,
+    textStrokeColor: [0, 0, 0]
+}
+
 const COLORS = {
     RED: [255, 0, 0, 255],
     GREEN: [0, 255, 0, 255],
@@ -32,6 +46,12 @@ const SYSTEMS = {
     validityManager: null,
     mediaCaptureManager: null
 }
+
+const INSTRUCTIONS = {
+    'StaticDotExperiment' : 'During this experiment, dots will appear one by one on your screen.\n Observe each dot closely. When a ← or → appears on the dot,\n press the button with the same arrow on your keyboard.\n Press ← or → on your keyboard to start.',
+    'MovingDotExperiment' : 'During this experiment, you will see a moving dot on your screen.\n Observe the dot closely. When a ← or → appears on the dot,\n press the button with the same arrow on your keyboard.\n Focus on the dot, then press ← or → on your keyboard to start.'
+}
+
 
 /*
 Maintains the unique, global source of event timing truth. No other event timing/interval systems should be used.
@@ -110,22 +130,47 @@ class Timer {
 Orchestrates the experiments by scheduling events and controlling component changes.
 */
 class DotExperimentManager {
-    constructor(experiment) {
-        this.experiment = experiment;
+    statisticsEndpoint = '/dataupload/statistics/';
+    experimentList = [];
+    experimentCounter = 0;
+
+    //params:
+    //  experiments - either a single experiment or an array of experiments. In case of an array, they will be processed in the order they appear.
+    constructor(experiments) {
+        if (experiments.constructor.name == 'Array') {
+            this.experimentList = experiments;
+            this.experiment = experiments.shift();
+        }
+        else {
+            this.experiment = experiments;
+        }
         this.experiment.endCallback = this.endOfExperiment.bind(this);
         this.timer = new Timer();
         this.finished = false;
         SYSTEMS.timer = this.timer;
         //initialize validity manager for validating user inputs
+        this.validityManager = new ValidityManager(this.experiment.dots);
+        SYSTEMS.validityManager = this.validityManager;
+        this.displayManager = new DisplayManager(this.experiment);
+        SYSTEMS.displayManager = this.displayManager;
+    }
+    
+    //loads an experiment and clears current results. Used to advance through multiple experiments in a single session
+    loadExperiment(experiment) {
+        this.experiment = experiment;
+        this.experiment.endCallback = this.endOfExperiment.bind(this);
+        this.finished = false;
         this.validityManager = new ValidityManager(experiment.dots);
         SYSTEMS.validityManager = this.validityManager;
+        this.displayManager = new DisplayManager(this.experiment);
+        SYSTEMS.displayManager = this.displayManager;
     }
     
     
     //starts the experiment, maintaining the timer used to display the dots
     start() {
         if (this.experiment.constructor.name == 'StaticDotExperiment') {            
-            this.timer.addInterval('nextTrial', this.experiment.interval, this.nextTrial.bind(this));            
+            this.timer.addInterval('nextTrial', this.experiment.interval * 2, this.nextTrial.bind(this));            
         }
         
         else {
@@ -162,7 +207,19 @@ class DotExperimentManager {
     //processes end of experiment signal
     endOfExperiment() {
         this.timer.stop();
-        fullscreen(false);
+        this.uploadStatistics(this.experimentCounter);
+        
+        //if more experiments remaining
+        if (this.experimentList.length > 0) {
+            //increase experiment count and process new experiment
+            this.experimentCounter += 1;
+            this.loadExperiment(this.experimentList.shift());
+            started = false;
+            
+        }
+        else {
+            fullscreen(false);
+        }
     }
     
     //return the result
@@ -170,10 +227,23 @@ class DotExperimentManager {
         var result = {
             score: this.validityManager.score,
             tests: this.validityManager.tests,
+            perDotResults: this.validityManager.perDotResults
         }
         return result;
     }
     
+    //uploads the gathered statistics to the server, to be used at the end of a block
+    //params:
+    //  metadata - metadata to append to the sent results
+    uploadStatistics(metadata) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('post', this.statisticsEndpoint);
+        var fd = new FormData();
+        fd.append('metadata', metadata);
+        fd.append('statistics', JSON.stringify(this.getResult().perDotResults));
+        xhr.send(fd);
+        
+    }
     //get total elapsed time
     getTime() {
         return this.timer.elapsedTime;
@@ -216,7 +286,9 @@ class InputManager {
         if (SYSTEMS.mediaCaptureManager.recorder && !started && isLeftOrRight) {
             started = true;
             experimentManager.start();
-            SYSTEMS.mediaCaptureManager.recorder.start();
+            if (SYSTEMS.experimentManager.experiment.constructor.name == "MovingDotExperiment") {
+                SYSTEMS.mediaCaptureManager.recorder.start();
+            }
         }
         else {
             SYSTEMS.validityManager.checkValidity(keyCode);
@@ -233,11 +305,13 @@ class MediaCaptureManager {
     videosEnpoint = '/dataupload/videos';
     imagesEndpoint = '/dataupload/images';
     imageBuffer = [];
+    videoBuffer = [];
+    sendVideo = true;
     
     constructor(mediaStream) {
         //initialize recorder for video capture
         this.recorder = new MediaRecorder(mediaStream);
-        this.recorder.ondataavailable = this.recorderDataAvailable;
+        this.recorder.ondataavailable = this.recorderDataAvailable.bind(this);
         
         //initialize virtual canvas for stills capture
         this.video = document.createElement('VIDEO');
@@ -250,6 +324,8 @@ class MediaCaptureManager {
         this.canvas.appendChild(this.video);
         this.context = this.canvas.getContext('2d');
         this.canvas.id = 'photoCanvas';
+        
+        //console.log('mediaCaptureManager constructor; this.videoBuffer = ', this.videoBuffer);
     }
 
     /*
@@ -311,16 +387,46 @@ class MediaCaptureManager {
     //callback for processing ready video data
     recorderDataAvailable(event) {
         var file = new File([event.data], 'video');
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', this.videosEndpoint);
-        var fd = new FormData();
-        fd.append('video', file);
-        xhr.send(fd);
+        if (this.sendVideo) {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', this.videosEndpoint);
+            var fd = new FormData();
+            fd.append('video', file);
+            xhr.send(fd);
+        }
+        else {
+            //append video file data to the buffer
+            this.videoBuffer.push({'video': file});
+        }
     }
 
     //stops recording experiment video
-    stopRecording() {
+    //params:
+    //  sendVideo - should the video be sent immediately
+    stopRecording(sendVideo=true) {
+        this.sendVideo = sendVideo;
         this.recorder.stop();
+    }
+
+    //adds metadata to last video
+    //params:
+    //  metadata - string of metadata to append to video
+    addLastVideoMetadata(metadata) {
+        this.videoBuffer[this.videoBuffer.length - 1]['metadata'] = metadata;
+    }
+
+    //sends all videos in temporary buffer and clears the buffer
+    sendVideos() {
+        for (var videoEntry of this.videoBuffer) {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', this.videosEndpoint);
+            var fd = new FormData();
+            fd.append('metadata', videoEntry['metadata']);
+            fd.append('video', videoEntry['video']);
+            xhr.send(fd);
+        }
+        this.videoBuffer = [];
+        
     }
 }
 
@@ -333,6 +439,7 @@ class ValidityManager {
         this.dots = dots;
         this.score = 0;
         this.tests = 0;
+        this.perDotResults = {};
         this.inputTested = false; //keep track of whtether input was already tested for this trial
     }
     
@@ -356,17 +463,18 @@ class ValidityManager {
                     if (SYMBOL_INPUT_MAP[dot.indicator.symbol] == keyCode) {
                         valid += 1;
                         dot.indicator.color = COLORS.GREEN; //green = correct answer
-                        console.log('scheduling final picture');
-                        //immediately take a picture
-                        SYSTEMS.mediaCaptureManager.takePicture(0);
-                        //schedule next one in 200ms
-                        SYSTEMS.timer.addInterval('finalPicture', 200, () => SYSTEMS.mediaCaptureManager.takePictureAndUpload(200), false);
                     }
                     else {
                         dot.indicator.color = COLORS.RED; //red = incorrect answer
                         
                         SYSTEMS.mediaCaptureManager.clearPictureBuffer(); //remove all images and discard
                     }
+                    
+                    this.perDotResults[SYSTEMS.experimentManager.experiment.trialsCompleted] = {
+                        'x' : dot.x,
+                        'y' : dot.y,
+                        'answerCorrect' : SYMBOL_INPUT_MAP[dot.indicator.symbol] == keyCode
+                    };
                 }
 
                 this.tests += 1; //count every test
@@ -399,14 +507,14 @@ class DisplayManager {
                 //draw the pulse
                 if (dot.pulsate) {
                     noFill();
-                    stroke(0, dot.pulse.opacity);
+                    stroke(this.experiment.experimentConfig.style.fill, dot.pulse.opacity);
                     strokeWeight(dot.pulse.strokeWeight);
                     circle(dot.x, dot.y, dot.pulse.r);
                 }
                 
                 //draw the circle
-                fill(DEFAULTSTYLE.fill);
-                stroke(0, 255);
+                fill(this.experiment.experimentConfig.style.fill);
+                stroke(this.experiment.experimentConfig.style.fill);
                 circle(dot.x, dot.y, dot.r);
                 
                 var indicatorColor = dot.indicator.color;
@@ -414,12 +522,13 @@ class DisplayManager {
                 //draw the indicator
                 if (indicatorColor[3] > 0) {
                     //display the indicator if it's visible (alpha > 0)
-                    textAlign(CENTER);
+                    textAlign(CENTER, CENTER);
                     textSize(dot.indicator.size);
-                    strokeWeight(DEFAULTSTYLE.textStrokeWeight);
-                    stroke(indicatorColor[0], indicatorColor[1], indicatorColor[2]);
+                    strokeWeight(this.experiment.experimentConfig.style.textStrokeWeight);
+                    var strokeColor = this.experiment.experimentConfig.style.textStrokeColor;
+                    stroke(strokeColor[0], strokeColor[1], strokeColor[2]);
                     fill(indicatorColor[0], indicatorColor[1], indicatorColor[2], indicatorColor[3]);
-                    text(dot.indicator.symbol, dot.x, dot.y + dot.indicator.size / 4);
+                    text(dot.indicator.symbol, dot.x, dot.y);
                     
                 }
                 
@@ -437,7 +546,9 @@ var staticDotExperimentConfig = {
     displayIndicators: true,
     displayVerification: true,
     snapAfterDisplay: 200,
-    snapAfterVerification: 200
+    snapAfterVerification: 200,
+    recordingDelay: 300,
+    style: GREY_ON_BLACK
 }
 
 var movingDotExperimentConfig = {
@@ -445,7 +556,8 @@ var movingDotExperimentConfig = {
     displayIndicators: true,
     indicatorCount: 1,
     randomIndicatorOffset: 2000,
-    displayVerification: true
+    displayVerification: true,
+    style: BLACK_ON_GREY
 }
 
 /*
@@ -480,7 +592,7 @@ class DotExperiment {
     
     //show dots passed by reference. if dots == null, show all dots
     showDots(dots) {
-        console.log('showing dots, param == null? ', dots == null);
+        //console.log('showing dots, param == null? ', dots == null);
         //console.log('this.dots = ', this.dots);
         if (dots == null) {
             for (var i = 0; i < this.dots.length; i++) {
@@ -500,7 +612,7 @@ class DotExperiment {
             }
         }
         
-        SYSTEMS.mediaCaptureManager.clearPictureBuffer(); //new trial, discard whatever was left in old one
+        //SYSTEMS.mediaCaptureManager.clearPictureBuffer(); //new trial, discard whatever was left in old one
         //console.log('calling after show dots');
         this.afterShowDots(dots);
     }
@@ -522,7 +634,11 @@ class DotExperiment {
                 dot.visible = false;
             }
         }
+        this.afterHideDots();
     }
+    
+    //additional function called after dots are hidden - to be implemented in sub-classes
+    afterHideDots() {}
     
     //randomizes dot positions
     randomizeDots() {
@@ -576,6 +692,12 @@ class DotExperiment {
             }
             SYSTEMS.validityManager.resetInputTest(); // re-enable inputs
         }
+        this.afterDisplayIndicators();
+    }
+    
+    //additional callback after indicators are displayed
+    afterDisplayIndicators() {
+        
     }
     
     //hides indicators on dots
@@ -583,7 +705,14 @@ class DotExperiment {
         for (var i = 0; i < this.dots.length; i++) {
             var dot = this.dots[i];
             dot.indicator.color = COLORS.INVISIBLE;
+            //add testing result if not saved due to lack of user input
+            var trialNo = SYSTEMS.experimentManager.experiment.trialsCompleted;
+            if (!SYSTEMS.validityManager.perDotResults[trialNo]) {
+                SYSTEMS.validityManager.perDotResults[trialNo] = { x: dot.x, y: dot.y, 'answerCorrect': false };
+            
+            }
         }
+        
     }
 }
 
@@ -600,18 +729,31 @@ class StaticDotExperiment extends DotExperiment {
     loadNextTrial(n, total) {
         this.randomizeDots();
         this.showDots();
-        SYSTEMS.timer.addInterval('hideDots', this.interval/2, this.hideDots.bind(this), false);
-        
-        //schedule first picture to be taken before the indicator appears, but after the user can notice the dot
-        SYSTEMS.timer.addInterval('takeFirstPicture', 200, () => SYSTEMS.mediaCaptureManager.takePicture(200), false);
-        //SYSTEMS.timer.addInterval('takeThirdPicture', this.interval - 200, () => SYSTEMS.mediaCaptureManager.takePicture(-200), false);
-        //SYSTEMS.timer.addInterval(null, this.interval*2, this.nextTrial, false);
+        SYSTEMS.timer.addInterval('hideDots', this.interval, this.hideDots.bind(this), false);
+        SYSTEMS.timer.addInterval('startRecording',SYSTEMS.experimentManager.experiment.experimentConfig.recordingDelay,
+                                  SYSTEMS.mediaCaptureManager.startRecording.bind(SYSTEMS.mediaCaptureManager), false);
         
     }
     
     afterShowDots(dots) { 
     }
     
+    afterDisplayIndicators() {
+        //keep the video in buffer to add to its metadata
+        SYSTEMS.mediaCaptureManager.stopRecording(false);
+    }
+    
+    afterHideDots() {
+        var dot = SYSTEMS.experimentManager.experiment.dots[0];
+        var meta = '' + dot.x + '_' + dot.y;
+        var dotResult = SYSTEMS.validityManager.perDotResults[SYSTEMS.experimentManager.experiment.trialsCompleted];
+        if (dotResult) {
+            meta += '_' + dotResult.answerCorrect; 
+        }
+        
+        SYSTEMS.mediaCaptureManager.addLastVideoMetadata(meta);
+        SYSTEMS.mediaCaptureManager.sendVideos();
+    }
     
 }
 
@@ -676,6 +818,9 @@ class MovingDotExperiment extends DotExperiment {
                     //else stop the dot motion
                     if (typeof(this.pathEndCallback) != 'undefined') {
                         this.pathEndCallback();
+                    }
+                    if (typeof(this.endCallback) != 'undefined') {
+                        this.endCallback();
                     }
                 }
             }
@@ -810,21 +955,24 @@ function setup() {
     readyButton = createButton('Ready');
     readyButton.center();
     readyButton.mousePressed(readyUp);
-    dot = new Dot(20, 20, 18, true, false);
+    var sdot = new Dot(20, 20, 18, true, false);
     /**/
-    staticDotExperiment = new StaticDotExperiment([dot], staticDotExperimentConfig);
+    staticDotExperiment = new StaticDotExperiment([sdot], staticDotExperimentConfig);
     //movingDotExperiment = new MovingDotExperiment([dot], movingDotExperimentConfig, null, () => {recorder.stop(); fullscreen(false);});
-    displayManager = new DisplayManager(staticDotExperiment);
-    experimentManager = new DotExperimentManager(staticDotExperiment);
+    //displayManager = new DisplayManager(staticDotExperiment);
+    
     //displayManager = new DisplayManager(movingDotExperiment);*/
     
     
+    var mdot = new Dot(20, 20, 18, true, true, generateZigZag(displayWidth, displayHeight));
+    movingDotExperiment = new MovingDotExperiment([mdot], movingDotExperimentConfig, null);
+    
+    experimentManager = new DotExperimentManager([movingDotExperiment, staticDotExperiment]);
     /*
-    movingDotExperiment = new MovingDotExperiment([dot], movingDotExperimentConfig, null);
     displayManager = new DisplayManager(movingDotExperiment);
     experimentManager = new DotExperimentManager(movingDotExperiment);
     //*/
-    SYSTEMS.displayManager = displayManager;
+    //SYSTEMS.displayManager = displayManager;
     
     inputManager = new InputManager;
     SYSTEMS.inputManager = inputManager;
@@ -832,7 +980,7 @@ function setup() {
     
     SYSTEMS.experimentManager = experimentManager;
     //
-    navigator.mediaDevices.getUserMedia({video:{width:{ideal:9999}, height:{ideal:9999}}, audio:false}).then((mediaStream) => {
+    navigator.mediaDevices.getUserMedia({video:{width:{ideal:9999}, height:{ideal:9999}, framerate:{ideal:999}}, audio:false}).then((mediaStream) => {
         var mediaCaptureManager = new MediaCaptureManager(mediaStream);
         SYSTEMS.mediaCaptureManager = mediaCaptureManager;
         
@@ -847,12 +995,21 @@ function takePicWithMeta() {
 
 function draw() {
     //dot.show();
-    background(DEFAULTSTYLE.background);
+    background(SYSTEMS.experimentManager.experiment.experimentConfig.style.background);
     if (started) {
         //advance time
         experimentManager.update();
     }
-    displayManager.display();
+    else if (ready) {
+        textSize(32);
+        textAlign(CENTER, CENTER);
+        strokeWeight(5);
+        stroke(32);
+        fill(255);
+        var instructions = INSTRUCTIONS[SYSTEMS.experimentManager.experiment.constructor.name];
+        text(instructions, width/2, height/2);
+    }
+    SYSTEMS.displayManager.display();
   // put drawing code here
 }
 
@@ -883,6 +1040,7 @@ function readyUp() {
 }
 
 module.exports = {
+    SYSTEMS,
     DEFAULTSTYLE,
     COLORS,
     Dot,
@@ -891,6 +1049,7 @@ module.exports = {
     MovingDotExperiment,
     DotExperimentManager,
     ValidityManager,
+    MediaCaptureManager,
     Timer,
     staticDotExperimentConfig,
     movingDotExperimentConfig,
